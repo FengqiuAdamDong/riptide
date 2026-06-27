@@ -411,3 +411,190 @@ class TimeSeries(object):
 
     def to_dict(self):
         return {"data": self.data, "tsamp": self.tsamp, "metadata": self.metadata}
+
+
+class TimeSeriesGappy(object):
+    """
+    Container for a collection of TimeSeries objects that share a common
+    sampling time.
+
+    All input series are forced onto a single sampling time, taken to be the
+    *longest* (coarsest) ``tsamp`` among them. Any series sampled more finely
+    is downsampled by the appropriate real-valued factor so that every series
+    in the collection ends up with the same ``tsamp``.
+
+    The series are ordered by observation epoch, i.e. by the ``mjd`` key of
+    their metadata.
+
+    Parameters
+    ----------
+    series : iterable of TimeSeries
+        The TimeSeries objects to group together. Must be non-empty.
+    copy : bool, optional
+        If set to True, series that do not require downsampling are copied
+        rather than referenced. Downsampled series always hold new data.
+
+    Attributes
+    ----------
+    series : list of TimeSeries
+        The collection of TimeSeries, all sharing the same ``tsamp`` and
+        ordered by observation epoch.
+    tsamp : float
+        The common sampling time in seconds (the longest ``tsamp`` of the
+        inputs).
+    """
+
+    def __init__(self, series, copy=False):
+        series = list(series)
+        if not series:
+            raise ValueError("'series' must contain at least one TimeSeries")
+        if not all(isinstance(ts, TimeSeries) for ts in series):
+            raise TypeError("every element of 'series' must be a TimeSeries")
+
+        # The common sampling time is the longest (coarsest) tsamp; finer
+        # series get downsampled down to it.
+        target_tsamp = max(ts.tsamp for ts in series)
+
+        aligned = []
+        for ts in series:
+            factor = target_tsamp / ts.tsamp
+            if np.isclose(factor, 1.0):
+                aligned.append(ts.copy() if copy else ts)
+            else:
+                aligned.append(ts.downsample(factor, inplace=False))
+
+        # Order by observation epoch (metadata 'mjd'). Series without a known
+        # epoch are placed last, preserving their relative input order.
+        def epoch_key(item):
+            index, ts = item
+            mjd = ts.metadata.get("mjd")
+            return (mjd is None, mjd if mjd is not None else 0.0, index)
+
+        aligned = [ts for _, ts in sorted(enumerate(aligned), key=epoch_key)]
+
+        self.series = aligned
+        self._tsamp = float(target_tsamp)
+
+    @property
+    def tsamp(self):
+        """Common sampling time of all series in seconds."""
+        return self._tsamp
+
+    @property
+    def gap_samples(self):
+        """Number of missing samples between each pair of consecutive
+        time series (which are ordered by observation epoch).
+
+        Returns
+        -------
+        gaps : list of int
+            A list of ``len(self) - 1`` integers; ``gaps[i]`` is the number of
+            samples (at the common ``tsamp``) that fall in the gap between
+            series ``i`` and series ``i + 1``.
+
+        Raises
+        ------
+        ValueError
+            If any series lacks an 'mjd' (observation start epoch) in its
+            metadata, in which case the gaps cannot be computed.
+        """
+        epochs = [ts.metadata.get("mjd") for ts in self.series]
+        if any(epoch is None for epoch in epochs):
+            raise ValueError(
+                "cannot compute inter-series gaps: every TimeSeries must have "
+                "an 'mjd' (observation start epoch) in its metadata"
+            )
+
+        # Express start times in seconds relative to the first epoch, to limit
+        # floating point precision loss when subtracting large MJD values.
+        ref_mjd = epochs[0]
+        gaps = []
+        for prev, cur in zip(self.series, self.series[1:]):
+            start_prev = (prev.metadata["mjd"] - ref_mjd) * 86400.0
+            end_prev = start_prev + prev.nsamp * self.tsamp
+            start_cur = (cur.metadata["mjd"] - ref_mjd) * 86400.0
+            gaps.append(int(round((start_cur - end_prev) / self.tsamp)))
+        return gaps
+
+    @classmethod
+    def generate(
+        cls, length, tsamp, period, gap_start=None, gap_length=None, mjd=58000.0,
+        **kwargs
+    ):
+        """Generate a long fake time series and cut out a chunk from the middle
+        so that the result is gappy. This is useful for test purposes.
+
+        The full series is generated with :meth:`TimeSeries.generate`, then
+        split into two segments around the excised gap. Each segment carries an
+        'mjd' start epoch consistent with its position in the original series,
+        so that :attr:`gap_samples` recovers the size of the cut.
+
+        Parameters
+        ----------
+        length : float
+            Total length of the full (pre-gap) data in seconds.
+        tsamp : float
+            Sampling time in seconds.
+        period : float
+            Signal period in seconds.
+        gap_start : float, optional
+            Time in seconds at which the gap begins. Defaults to ``length / 3``.
+        gap_length : float, optional
+            Duration of the excised chunk in seconds. Defaults to
+            ``length / 3``.
+        mjd : float, optional
+            Observation start epoch (MJD) of the full series.
+        **kwargs
+            Extra keyword arguments passed to :meth:`TimeSeries.generate`
+            (``phi0``, ``ducy``, ``amplitude``, ``stdnoise``).
+
+        Returns
+        -------
+        out : TimeSeriesGappy
+            A gappy time series made of two segments.
+        """
+        full = TimeSeries.generate(length, tsamp, period, **kwargs)
+        nsamp = full.nsamp
+
+        if gap_start is None:
+            gap_start = length / 3.0
+        if gap_length is None:
+            gap_length = length / 3.0
+
+        istart = int(round(gap_start / tsamp))
+        iend = int(round((gap_start + gap_length) / tsamp))
+        if not 0 < istart < iend < nsamp:
+            raise ValueError(
+                "the gap must lie strictly within the data: require "
+                "0 < gap_start < gap_start + gap_length < length"
+            )
+
+        base = dict(full.metadata)
+        meta_before = Metadata({**base, "mjd": mjd})
+        meta_after = Metadata({**base, "mjd": mjd + iend * tsamp / 86400.0})
+
+        before = TimeSeries(
+            full.data[:istart], tsamp, copy=True, metadata=meta_before
+        )
+        after = TimeSeries(
+            full.data[iend:], tsamp, copy=True, metadata=meta_after
+        )
+        return cls([before, after])
+
+    def __len__(self):
+        return len(self.series)
+
+    def __getitem__(self, index):
+        return self.series[index]
+
+    def __iter__(self):
+        return iter(self.series)
+
+    def __str__(self):
+        name = type(self).__name__
+        return "{name} {{nseries = {n:d}, tsamp = {t:.4e}}}".format(
+            name=name, n=len(self.series), t=self.tsamp
+        )
+
+    def __repr__(self):
+        return str(self)

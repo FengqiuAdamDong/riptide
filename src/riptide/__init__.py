@@ -3,7 +3,7 @@
 from ._version import version as __version__
 
 ### Major classes
-from .time_series import TimeSeries
+from .time_series import TimeSeries, TimeSeriesGappy
 from .periodogram import Periodogram
 from .metadata import Metadata
 from .candidate import Candidate
@@ -21,6 +21,7 @@ from .serialization import save_json, load_json
 
 __all__ = [
     "TimeSeries",
+    "TimeSeriesGappy",
     "Periodogram",
     "Metadata",
     "Candidate",
