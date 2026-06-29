@@ -1,5 +1,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+#include <vector>
+#include <tuple>
 
 #include <algorithm>
 #include <stdexcept>
@@ -209,6 +213,67 @@ std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > per
 }
 
 
+std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > periodogram_gappy(
+    std::vector<py::array_t<float>> arr_data_list,
+    py::array_t<size_t> arr_gaps,
+    double tsamp,
+    py::array_t<size_t> arr_widths,
+    double period_min,
+    double period_max,
+    size_t bins_min,
+    size_t bins_max)
+{
+    const size_t num_data = arr_data_list.size();
+    if (num_data < 1)
+        throw std::invalid_argument("must provide at least one data segment");
+
+    assert_c_contiguous(arr_gaps);
+    assert_c_contiguous(arr_widths);
+
+    auto gaps = arr_gaps.unchecked<1>();
+    if (gaps.size() != (num_data - 1))
+        throw std::invalid_argument("'gaps' must have exactly num_data - 1 elements");
+
+    auto widths = arr_widths.unchecked<1>();
+    const size_t num_widths = widths.size();
+
+    // Collect one pointer and sample count per segment.
+    std::vector<const float*> data_ptrs(num_data);
+    std::vector<size_t> sizes(num_data);
+    for (size_t i = 0; i < num_data; ++i) {
+        assert_c_contiguous(arr_data_list[i]);
+        auto seg = arr_data_list[i].unchecked<1>();
+        data_ptrs[i] = seg.data(0);
+        sizes[i] = seg.size();
+    }
+
+    // gaps.data(0) is only valid when there is at least one gap.
+    const size_t* gaps_ptr = (num_data > 1) ? gaps.data(0) : nullptr;
+
+    // The output length is driven by the total span (data + gaps), exactly as
+    // periodogram() is driven by the contiguous series length.
+    size_t total_size = 0;
+    for (size_t i = 0; i < num_data; ++i)
+        total_size += sizes[i];
+    for (size_t i = 0; i + 1 < num_data; ++i)
+        total_size += gaps(i);
+
+    size_t length = riptide::periodogram_length(total_size, tsamp, period_min, period_max, bins_min, bins_max);
+
+    auto periods = new_cstyle_array<double>({length});
+    auto foldbins = new_cstyle_array<uint32_t>({length});
+    auto snrs = new_cstyle_array<float>({length, num_widths});
+
+    riptide::periodogram_gappy(
+        data_ptrs.data(), sizes.data(), gaps_ptr, num_data, tsamp,
+        widths.data(0), num_widths, period_min, period_max, bins_min, bins_max,
+        periods.mutable_data(0), foldbins.mutable_data(0), snrs.mutable_data(0)
+        );
+
+    return std::make_tuple(periods, foldbins, snrs);
+}
+
+
 py::array_t<float> running_median(py::array_t<float> arr_x, size_t width)
 {
     assert_c_contiguous(arr_x);
@@ -268,6 +333,15 @@ PYBIND11_MODULE(libcpp, m)
         "periodogram", &periodogram,
         py::arg("data"), py::arg("tsamp"), py::arg("widths"), py::arg("period_min"), py::arg("period_max"), py::arg("bins_min"), py::arg("bins_max"),
         "Compute the periodogram of a time series. Returns a 3-tuple of arrays: trial periods, number of phase bins, S/N"
+    );
+
+    m.def(
+        "periodogram_gappy", &periodogram_gappy,
+        py::arg("data_list"), py::arg("gaps"), py::arg("tsamp"), py::arg("widths"), py::arg("period_min"), py::arg("period_max"), py::arg("bins_min"), py::arg("bins_max"),
+        "Compute the periodogram of a gappy time series, made of several non-contiguous segments.\n"
+        "'data_list' is a list of 1D float32 arrays (one normalised segment each), and 'gaps' is an\n"
+        "array of num_segments - 1 sample counts giving the number of missing samples between\n"
+        "consecutive segments. Returns a 3-tuple of arrays: trial periods, number of phase bins, S/N."
     );
 
     m.def(

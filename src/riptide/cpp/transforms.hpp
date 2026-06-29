@@ -3,6 +3,7 @@
 
 #include <cstddef> // size_t
 #include <cstring> // memcpy()
+#include <cstdio>  // fprintf()
 
 #include "kernels.hpp"
 #include "block.hpp"
@@ -22,6 +23,25 @@ void merge(ConstBlock thead, ConstBlock ttail, Block out)
         const size_t h = kh * s + 0.5f;
         const size_t t = kt * s + 0.5f;
         const size_t b = s - (h + t);
+        //print h, t, b
+        fused_rollback_add(thead.rowptr(h), ttail.rowptr(t), p, h+b, out.rowptr(s));
+        }
+    }
+
+void merge_gappy(ConstBlock thead, ConstBlock ttail, Block out)
+    {
+    const size_t m = out.rows;
+    const size_t p = out.cols;
+    const float kh = (thead.rows - 1.0f) / (m - 1.0f);
+    const float kt = (ttail.rows - 1.0f) / (m - 1.0f);
+
+    for (size_t s = 0; s < m; ++s)
+        {
+        const size_t h = kh * s + 0.5f;
+        const size_t t = kt * s + 0.5f;
+        const size_t b = s - (h + t);
+        //print h, t, b
+        fprintf(stderr, "merge: s=%zu h=%zu t=%zu b=%zu\n", s, h, t, b);
         fused_rollback_add(thead.rowptr(h), ttail.rowptr(t), p, h+b, out.rowptr(s));
         }
     }

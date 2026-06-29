@@ -9,7 +9,7 @@ from .metadata import Metadata
 from .candidate import Candidate
 
 ### Major functions
-from .search import ffa_search
+from .search import ffa_search, ffa_search_gappy
 from .running_medians import running_median, fast_running_median
 
 from .libffa import ffa1, ffa2, ffafreq, ffaprd, generate_signal, downsample, boxcar_snr
@@ -26,6 +26,7 @@ __all__ = [
     "Metadata",
     "Candidate",
     "ffa_search",
+    "ffa_search_gappy",
     "ffa1",
     "ffa2",
     "ffafreq",
