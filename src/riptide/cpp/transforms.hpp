@@ -41,7 +41,7 @@ void merge_gappy(ConstBlock thead, ConstBlock ttail, Block out)
         const size_t t = kt * s + 0.5f;
         const size_t b = s - (h + t);
         //print h, t, b
-        fprintf(stderr, "merge: s=%zu h=%zu t=%zu b=%zu\n", s, h, t, b);
+        // fprintf(stderr, "merge: s=%zu h=%zu t=%zu b=%zu\n", s, h, t, b);
         fused_rollback_add(thead.rowptr(h), ttail.rowptr(t), p, h+b, out.rowptr(s));
         }
     }

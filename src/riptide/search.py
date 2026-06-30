@@ -2,9 +2,33 @@ import numpy as np
 
 ### Local module imports
 import riptide.libcpp as libcpp
+from . import periodogram_py
 from .ffautils import generate_width_trials
 from .periodogram import Periodogram
 from .timing import timing
+
+
+# Available periodogram kernel backends. "cpp" uses the compiled libcpp
+# extension; "python" uses the pure-numpy reference port in periodogram_py
+# (slower, but useful for testing/verification and for environments without the
+# compiled extension).
+_PERIODOGRAM_BACKENDS = {
+    "cpp": libcpp.periodogram,
+    "python": periodogram_py.periodogram,
+}
+_PERIODOGRAM_GAPPY_BACKENDS = {
+    "cpp": libcpp.periodogram_gappy,
+    "python": periodogram_py.periodogram_gappy,
+}
+
+
+def _resolve_backend(backends, backend):
+    try:
+        return backends[backend]
+    except KeyError:
+        raise ValueError(
+            f"unknown backend {backend!r}; choose one of {sorted(backends)}"
+        )
 
 
 @timing
@@ -21,6 +45,7 @@ def ffa_search(
     rmed_width=4.0,
     rmed_minpts=101,
     already_normalised=False,
+    backend="cpp",
 ):
     """
     Run a FFA search of a single TimeSeries object, producing its periodogram.
@@ -70,6 +95,10 @@ def ffa_search(
     already_normalised : bool
         Assume that the data are already normalised to zero mean and unit
         standard deviation
+    backend : str
+        Which periodogram kernel implementation to use: "cpp" (default, the
+        compiled libcpp extension) or "python" (the pure-numpy reference port in
+        periodogram_py). Both produce the same result to float32 precision.
 
     Returns
     -------
@@ -79,6 +108,8 @@ def ffa_search(
         The output of the search, which contains among other things a 2D array
         representing S/N as a function of trial period and trial width.
     """
+    periodogram = _resolve_backend(_PERIODOGRAM_BACKENDS, backend)
+
     ### Prepare data: deredden then normalise IN THAT ORDER
     if deredden:
         tseries = tseries.deredden(rmed_width, minpts=rmed_minpts)
@@ -86,7 +117,7 @@ def ffa_search(
         tseries = tseries.normalise()
 
     widths = generate_width_trials(bins_min, ducy_max=ducy_max, wtsp=wtsp)
-    periods, foldbins, snrs = libcpp.periodogram(
+    periods, foldbins, snrs = periodogram(
         tseries.data, tseries.tsamp, widths, period_min, period_max, bins_min, bins_max
     )
     pgram = Periodogram(widths, periods, foldbins, snrs, metadata=tseries.metadata)
@@ -107,6 +138,7 @@ def ffa_search_gappy(
     rmed_width=4.0,
     rmed_minpts=101,
     already_normalised=False,
+    backend="cpp",
 ):
     """
     Run a FFA search of a TimeSeriesGappy object, producing its periodogram.
@@ -166,6 +198,10 @@ def ffa_search_gappy(
     already_normalised : bool
         Assume that each segment is already normalised to zero mean and unit
         standard deviation
+    backend : str
+        Which periodogram kernel implementation to use: "cpp" (default, the
+        compiled libcpp extension) or "python" (the pure-numpy reference port in
+        periodogram_py). Both produce the same result to float32 precision.
 
     Returns
     -------
@@ -176,6 +212,8 @@ def ffa_search_gappy(
         The output of the search, which contains among other things a 2D array
         representing S/N as a function of trial period and trial width.
     """
+    periodogram_gappy = _resolve_backend(_PERIODOGRAM_GAPPY_BACKENDS, backend)
+
     # Number of samples missing between each pair of consecutive segments.
     # Accessing this also enforces that every segment carries an 'mjd' epoch.
     gaps = np.asarray(tsgappy.gap_samples, dtype=np.uintp)
@@ -200,7 +238,7 @@ def ffa_search_gappy(
     data_list = [np.ascontiguousarray(seg.data, dtype=np.float32) for seg in segments]
 
     widths = generate_width_trials(bins_min, ducy_max=ducy_max, wtsp=wtsp)
-    periods, foldbins, snrs = libcpp.periodogram_gappy(
+    periods, foldbins, snrs = periodogram_gappy(
         data_list, gaps, tsgappy.tsamp, widths, period_min, period_max, bins_min, bins_max
     )
     pgram = Periodogram(

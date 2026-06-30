@@ -404,12 +404,12 @@ void periodogram_gappy(
                 rows_eval[i] = std::min(rows[i], ceilshift(rows[i], bins, period_ceil[i]));
 
                 const size_t seg_bufsize = downsampled_size(sizes[i], ds_ini);
-                fprintf(stderr,
-                    "    [ds %zu bins %zu] transform seg %zu: rows=%zu rows_eval=%zu "
-                    "writes=%zu floats, seg_bufsize=%zu %s\n",
-                    ids, bins, i, rows[i], rows_eval[i], rows[i] * bins, seg_bufsize,
-                    (rows[i] * bins > seg_bufsize) ? "*** OVERFLOW ***" : "");
-                fflush(stderr);
+                // fprintf(stderr,
+                    // "    [ds %zu bins %zu] transform seg %zu: rows=%zu rows_eval=%zu "
+                    // "writes=%zu floats, seg_bufsize=%zu %s\n",
+                    // ids, bins, i, rows[i], rows_eval[i], rows[i] * bins, seg_bufsize,
+                    // (rows[i] * bins > seg_bufsize) ? "*** OVERFLOW ***" : "");
+                // fflush(stderr);
 
                 transform(input[i], rows[i], bins, ffabuf_mem[i].get(), ffaout_mem[i].get());
 
@@ -421,17 +421,17 @@ void periodogram_gappy(
             // be plotted as 2D intensity maps. Gated to the first downsampling
             // and first bins value to avoid flooding the disk; change the
             // condition to capture a different (ids, bins) slice.
-            const bool dump_this_iter = (ids == 0 && bins == bstart);
-            if (dump_this_iter)
-                {
-                for (size_t i = 0; i < num_data; ++i)
-                    {
-                    char path[256];
-                    snprintf(path, sizeof(path),
-                        "debug_ffaout_seg%zu_r%zu_c%zu.bin", i, rows[i], bins);
-                    dump_block_bin(path, ffaout_mem[i].get(), rows[i], bins);
-                    }
-                }
+            // const bool dump_this_iter = (ids == 0 && bins == bstart);
+            // if (dump_this_iter)
+            //     {
+            //     for (size_t i = 0; i < num_data; ++i)
+            //         {
+            //         char path[256];
+            //         snprintf(path, sizeof(path),
+            //             "debug_ffaout_seg%zu_r%zu_c%zu.bin", i, rows[i], bins);
+            //         dump_block_bin(path, ffaout_mem[i].get(), rows[i], bins);
+            //         }
+            //     }
             //time to merge all the ffaout_mems together
 
             const size_t total_rows = n_total / bins;
@@ -444,12 +444,12 @@ void periodogram_gappy(
             const double total_period_ceil = std::min(period_max_samples, bins + 1.0);
             const size_t total_rows_eval = std::min(total_rows, ceilshift(total_rows, bins, total_period_ceil));
 
-            fprintf(stderr,
-                "  [ds %zu bins %zu] total_rows=%zu total_rows_eval=%zu "
-                "merge writes=%zu floats into ffaout_total (bufsize=%zu) %s\n",
-                ids, bins, total_rows, total_rows_eval, total_rows_eval * bins, total_bufsize,
-                (total_rows_eval * bins > total_bufsize) ? "*** OVERFLOW ***" : "");
-            fflush(stderr);
+            // fprintf(stderr,
+            //     "  [ds %zu bins %zu] total_rows=%zu total_rows_eval=%zu "
+            //     "merge writes=%zu floats into ffaout_total (bufsize=%zu) %s\n",
+            //     ids, bins, total_rows, total_rows_eval, total_rows_eval * bins, total_bufsize,
+            //     (total_rows_eval * bins > total_bufsize) ? "*** OVERFLOW ***" : "");
+            // fflush(stderr);
 
             for (size_t i = 0; i < num_data-1; ++i)
                 {
@@ -468,13 +468,13 @@ void periodogram_gappy(
                 }
 
             // Dump the merged transform for the same iteration as the segments.
-            if (dump_this_iter)
-                {
-                char path[256];
-                snprintf(path, sizeof(path),
-                    "debug_ffaout_total_r%zu_c%zu.bin", total_rows_eval, bins);
-                dump_block_bin(path, ffaout_total.get(), total_rows_eval, bins);
-                }
+            // if (dump_this_iter)
+            //     {
+            //     char path[256];
+            //     snprintf(path, sizeof(path),
+            //         "debug_ffaout_total_r%zu_c%zu.bin", total_rows_eval, bins);
+            //     dump_block_bin(path, ffaout_total.get(), total_rows_eval, bins);
+            //     }
 
             // Noise level of the merged profile. Each phase bin of the merged
             // transform is the sum of the real (non-gap) samples that fall in
