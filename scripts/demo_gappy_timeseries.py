@@ -135,7 +135,7 @@ def normalise_snr(snr):
     return (snr - median) / iqr
 
 
-def demo_generate(nseg=10, seg_length=30.0, tsamp=0.01, base_gap=10.0):
+def demo_generate(nseg=10, seg_length=30.0, tsamp=0.01, base_gap=300.0):
     banner(f"1. TimeSeriesGappy: {nseg} segments separated by random gaps")
     # Build ONE long, phase-coherent series spanning the whole timeline (all
     # segments + all gaps), then cut the gap regions out so the surviving
