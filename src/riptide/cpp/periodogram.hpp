@@ -205,28 +205,6 @@ void periodogram(
 
 
 /*
-Debug helper: dump a (rows x cols) row-major float buffer to a raw binary file
-so it can be loaded and plotted as a 2D intensity map in Python. The shape is
-encoded in the filename, e.g. "debug_ffaout_seg0_r123_c240.bin", and the payload
-is rows*cols little-endian float32 values, no header. Load with:
-    np.fromfile(path, dtype=np.float32).reshape(rows, cols)
-*/
-inline void dump_block_bin(const char* path, const float* data, size_t rows, size_t cols)
-    {
-    FILE* fp = fopen(path, "wb");
-    if (!fp)
-        {
-        // fprintf(stderr, "dump_block_bin: could not open %s for writing\n", path);
-        return;
-        }
-    fwrite(data, sizeof(float), rows * cols, fp);
-    fclose(fp);
-    // fprintf(stderr, "dump_block_bin: wrote %s (%zu x %zu)\n", path, rows, cols);
-    // fflush(stderr);
-    }
-
-
-/*
 Like periodogram(), but for a "gappy" time series made of several separate data
 segments that are not contiguous in time.
 
@@ -240,10 +218,17 @@ Instead of a single contiguous array, the caller passes:
               MISSING samples (at the original 'tsamp' resolution) between the end
               of segment i and the start of segment i + 1.
 
-This function deliberately STOPS after FFA-transforming each segment, so that the
-gap-aware combination of the per-segment transforms (and the subsequent S/N
-evaluation) can be filled in by hand. See the clearly marked manual-edit section
-inside the FFA transform loop.
+The gappy series is treated as ONE zero-padded contiguous series
+(seg0 | zeros(gap0) | seg1 | zeros(gap1) | ...), downsampled and FFA-transformed
+as a single unit. This is exactly the zero-pad ground truth of the gappy
+periodogram: the zeros hold each segment's samples at their correct phase while
+contributing nothing to the folded sums. The only optimisation over a plain
+periodogram() on the padded series is that transform_gappy() skips FFA sub-blocks
+that fall entirely inside a gap (they are all-zero, so their transform is
+themselves). The result is therefore bit-for-bit identical to periodogram() run
+on the zero-padded series.
+
+Faithful port of periodogram_py.periodogram_gappy.
 */
 void periodogram_gappy(
     const float* const* __restrict__ data,
@@ -262,15 +247,6 @@ void periodogram_gappy(
     float* __restrict__ snr)
     {
     periodogram_check_arg(num_data >= 1, "num_data must be >= 1");
-    //print every element of the data so that I can see what it looks likes
-    // printf("num_data: %zu\n", num_data);
-    // for (size_t i = 0; i < num_data; ++i)
-    //     {
-    //       for (size_t j = 0; j < sizes[i]; ++j)
-    //         {
-    //           printf("data[%zu][%zu]: %f\n", i, j, data[i][j]);
-    //         }
-    //     }
 
     // Total span of the equivalent gappy series in samples: the data samples plus
     // the missing samples that fall in the gaps. This drives the downsampling
@@ -283,6 +259,22 @@ void periodogram_gappy(
 
     periodogram_check_arguments(total_size, tsamp, period_min, period_max, bins_min, bins_max);
 
+    // Build the zero-padded contiguous series: each segment is copied to its
+    // offset, the inter-segment gaps are left as zeros.
+    std::unique_ptr<float[]> data_padded(new float[total_size]);
+    std::fill(data_padded.get(), data_padded.get() + total_size, 0.0f);
+    {
+    size_t offset = 0;
+    for (size_t i = 0; i < num_data; ++i)
+        {
+        memcpy(data_padded.get() + offset, data[i], sizes[i] * sizeof(float));
+        offset += sizes[i];
+        if (i + 1 < num_data)
+            offset += gaps[i];
+        }
+    }
+    const float* full = data_padded.get();
+
     // Initial downsampling factor
     // We want: ds_ini * tsamp * bmin = period_min
     double ds_ini = period_min / (tsamp * bins_min);
@@ -293,228 +285,96 @@ void periodogram_gappy(
     // Number of required downsampling cycles
     size_t num_downsamplings = ceil(log(period_max / period_min) / log(ds_geo));
 
-    // Per-segment work buffers, each large enough to hold its segment at the
+    // Work buffers, each large enough to hold the whole padded series at the
     // finest (initial) downsampling factor, i.e. its largest downsampled size.
-    // Allocated once and reused across the downsampling loop. The per-segment
-    // FFA outputs (ffaout_mem) persist between iterations so they remain
-    // available to the manual-edit section all at once.
-    std::vector<std::unique_ptr<float[]>> input_mem(num_data);
-    std::vector<std::unique_ptr<float[]>> ffabuf_mem(num_data);
-    std::vector<std::unique_ptr<float[]>> ffaout_mem(num_data);
-    for (size_t i = 0; i < num_data; ++i)
-        {
-        const size_t bufsize = downsampled_size(sizes[i], ds_ini);
-        input_mem[i].reset(new float[bufsize]);
-        ffabuf_mem[i].reset(new float[bufsize]);
-        ffaout_mem[i].reset(new float[bufsize]);
-        }
-
-    // FFA output buffer for the whole gappy series treated as a single,
-    // zero-padded-across-the-gaps contiguous series. Sized to the full span
-    // (data + gaps) at the finest (initial) downsampling factor, i.e. its
-    // largest possible downsampled size.
-    const size_t total_bufsize = downsampled_size(total_size, ds_ini);
-    std::unique_ptr<float[]> ffaout_total(new float[total_bufsize]);
+    const size_t bufsize = downsampled_size(total_size, ds_ini);
+    std::unique_ptr<float[]> input_mem(new float[bufsize]);
+    std::unique_ptr<float[]> ffabuf_mem(new float[bufsize]);
+    std::unique_ptr<float[]> ffaout_mem(new float[bufsize]);
+    const float* input = input_mem.get();
+    float* ffabuf = ffabuf_mem.get();
+    float* ffaout = ffaout_mem.get();
 
     /* Downsampling loop */
     for (size_t ids = 0; ids < num_downsamplings; ++ids)
         {
-        // fprintf(stderr, "[ds %zu/%zu] starting downsampling loop\n", ids, num_downsamplings);
         const double f = ds_ini * pow(ds_geo, ids); // current downsampling factor
         const double tau = f * tsamp; // current sampling time
         const double period_max_samples = period_max / tau;
-        const size_t n_total = downsampled_size(total_size, f);
+        const size_t n = downsampled_size(total_size, f); // current number of input samples
 
-        // fprintf(stderr,
-            // "[ds %zu/%zu] f=%.4f tau=%.6e period_max_samples=%.2f n_total=%zu total_bufsize=%zu\n",
-            // ids, num_downsamplings, f, tau, period_max_samples, n_total, total_bufsize);
-        // fflush(stderr);
-
-        // Downsample every segment to the current resolution, and express each
-        // gap in the current (downsampled) number of samples.
-        std::vector<const float*> input(num_data);
-        std::vector<size_t> n(num_data); // downsampled sample count per segment
-        for (size_t i = 0; i < num_data; ++i)
+        // downsample() requires f > 1, but we still allow searching the data at
+        // their original resolution.
+        if (f == 1)
+            input = full;
+        else
             {
-            n[i] = downsampled_size(sizes[i], f);
-
-            // fprintf(stderr,
-                // "  [ds %zu] downsampling segment %zu: sizes[i]=%zu -> n[i]=%zu (f=%.4f)\n",
-                // ids, i, sizes[i], n[i], f);
-            // fflush(stderr);
-
-            // downsample() requires f > 1, but we still allow searching the data
-            // at their original resolution.
-            if (f == 1)
-                {
-                input[i] = data[i];
-                }
-            else
-                {
-                downsample(data[i], sizes[i], f, input_mem[i].get());
-                input[i] = input_mem[i].get();
-                }
+            downsample(full, total_size, f, input_mem.get());
+            input = input_mem.get();
             }
 
-        std::vector<size_t> gap(num_data > 0 ? num_data - 1 : 0);
-        for (size_t i = 0; i + 1 < num_data; ++i)
+        // Locate every gap in the DOWNSAMPLED array. The full zero-padded series
+        // is downsampled as a single unit, so a raw sample position P maps to the
+        // output index downsampled_size(P, f). Compute the gap edges from the
+        // cumulative raw positions (floor(a/f) + floor(b/f) != floor((a+b)/f), so
+        // only the whole-array mapping is consistent with input = downsample()).
+        const size_t num_gaps = (num_data > 0) ? num_data - 1 : 0;
+        std::vector<size_t> gap_start_ds(num_gaps);
+        std::vector<size_t> gap_end_ds(num_gaps);
+        {
+        size_t raw = 0; // cumulative raw sample position
+        for (size_t i = 0; i < num_gaps; ++i)
             {
-            gap[i] = (size_t) llround(gaps[i] / f);
-            // fprintf(stderr, "  [ds %zu] gap[%zu] = %zu (orig %zu)\n",
-                // ids, i, gap[i], gaps[i]);
-            // fflush(stderr);
+            raw += sizes[i]; // end of segment i == start of gap i
+            gap_start_ds[i] = downsampled_size(raw, f);
+            gap_end_ds[i]   = downsampled_size(raw + gaps[i], f);
+            raw += gaps[i];  // advance to start of segment i + 1
             }
-
-        // The shortest segment caps the number of phase bins we can FFA transform
-        // with, to avoid a transform with 0 rows on any segment.
-        size_t nmin = n[0];
-        for (size_t i = 1; i < num_data; ++i)
-            nmin = std::min(nmin, n[i]);
+        }
 
         // Min and max number of bins with which to FFA transform in order to
         // cover all trial periods between period_min and period_max.
         // NOTE: bstop is INclusive.
+        // Also, we MUST enforce bstop <= n, to avoid doing an FFA transform with 0 rows
         const size_t bstart = bins_min;
-        const size_t bstop = std::min({ bins_max, nmin, size_t(period_max_samples) });
-
-        // fprintf(stderr, "  [ds %zu] nmin=%zu bstart=%zu bstop=%zu\n",
-            // ids, nmin, bstart, bstop);
-        // fflush(stderr);
+        const size_t bstop = std::min({ bins_max, n, size_t(period_max_samples) });
 
         /* FFA transform loop */
         for (size_t bins = bstart; bins <= bstop; ++bins)
             {
-            // FFA transform each segment independently into its own persistent
-            // ffaout buffer. After this loop, every segment's transform is
-            // available simultaneously, ready to be combined across the gaps.
-            // fprintf(stderr, "  [ds %zu/%zu] FFA transform loop: bins=%zu/%zu\n", ids, num_downsamplings, bins, bstop);
-            // fflush(stderr);
+            const size_t rows = n / bins;
+            const float stdnoise = sqrt(rows * downsampled_variance(total_size, f));
+            const double period_ceil = std::min(period_max_samples, bins + 1.0);
+            const size_t rows_eval = std::min(rows, ceilshift(rows, bins, period_ceil));
 
-
-            std::vector<size_t> rows(num_data);
-            std::vector<float> stdnoise(num_data);
-            std::vector<double> period_ceil(num_data);
-            std::vector<size_t> rows_eval(num_data);
-
-            for (size_t i = 0; i < num_data; ++i)
+            // Rows of the (rows x bins) reshaped block that fall ENTIRELY inside a
+            // gap: for gap i, rows strictly between gap_start_ds[i]/bins and
+            // gap_end_ds[i]/bins. These sub-blocks are all zeros and are skipped
+            // by transform_gappy. Built in ascending order (segments are ordered).
+            std::vector<size_t> gap_rows;
+            for (size_t i = 0; i < num_gaps; ++i)
                 {
-                rows[i] = n[i] / bins;
-                stdnoise[i] = sqrt(rows[i] * downsampled_variance(sizes[i], f));
-                period_ceil[i] = std::min(period_max_samples, bins + 1.0);
-                rows_eval[i] = std::min(rows[i], ceilshift(rows[i], bins, period_ceil[i]));
-
-                const size_t seg_bufsize = downsampled_size(sizes[i], ds_ini);
-                // fprintf(stderr,
-                    // "    [ds %zu bins %zu] transform seg %zu: rows=%zu rows_eval=%zu "
-                    // "writes=%zu floats, seg_bufsize=%zu %s\n",
-                    // ids, bins, i, rows[i], rows_eval[i], rows[i] * bins, seg_bufsize,
-                    // (rows[i] * bins > seg_bufsize) ? "*** OVERFLOW ***" : "");
-                // fflush(stderr);
-
-                transform(input[i], rows[i], bins, ffabuf_mem[i].get(), ffaout_mem[i].get());
-
-                // fprintf(stderr, "    [ds %zu bins %zu] transform seg %zu OK\n", ids, bins, i);
-                // fflush(stderr);
+                const size_t gr_start = gap_start_ds[i] / bins;
+                const size_t gr_end = gap_end_ds[i] / bins;
+                for (size_t r = gr_start + 1; r < gr_end && r < rows; ++r)
+                    gap_rows.push_back(r);
                 }
 
-            // Dump the per-segment FFA transforms for ONE iteration so they can
-            // be plotted as 2D intensity maps. Gated to the first downsampling
-            // and first bins value to avoid flooding the disk; change the
-            // condition to capture a different (ids, bins) slice.
-            // const bool dump_this_iter = (ids == 0 && bins == bstart);
-            // if (dump_this_iter)
-            //     {
-            //     for (size_t i = 0; i < num_data; ++i)
-            //         {
-            //         char path[256];
-            //         snprintf(path, sizeof(path),
-            //             "debug_ffaout_seg%zu_r%zu_c%zu.bin", i, rows[i], bins);
-            //         dump_block_bin(path, ffaout_mem[i].get(), rows[i], bins);
-            //         }
-            //     }
-            //time to merge all the ffaout_mems together
+            transform_gappy(input, rows, bins, ffabuf, ffaout,
+                            gap_rows.data(), gap_rows.size());
 
-            const size_t total_rows = n_total / bins;
-            // IMPORTANT: cap the evaluated rows by min(period_max_samples, bins + 1),
-            // exactly as periodogram_length() does. The 'bins + 1' term restricts
-            // each transform to trial periods in [bins, bins + 1) so successive bins
-            // values don't produce overlapping (and over-counted) trials. Without
-            // it, total_rows_eval balloons up to total_rows and we write far more
-            // trials than the output arrays were sized for -> buffer overrun.
-            const double total_period_ceil = std::min(period_max_samples, bins + 1.0);
-            const size_t total_rows_eval = std::min(total_rows, ceilshift(total_rows, bins, total_period_ceil));
+            auto block = ConstBlock(ffaout, rows_eval, bins);
+            snr2(block, widths, num_widths, stdnoise, snr);
 
-            // fprintf(stderr,
-            //     "  [ds %zu bins %zu] total_rows=%zu total_rows_eval=%zu "
-            //     "merge writes=%zu floats into ffaout_total (bufsize=%zu) %s\n",
-            //     ids, bins, total_rows, total_rows_eval, total_rows_eval * bins, total_bufsize,
-            //     (total_rows_eval * bins > total_bufsize) ? "*** OVERFLOW ***" : "");
-            // fflush(stderr);
-
-            for (size_t i = 0; i < num_data-1; ++i)
+            for (size_t s = 0; s < rows_eval; ++s)
                 {
-                //merge ffaout_mem[i] and ffaout_mem[i+1] into ffaout_total
-                //
-                // fprintf(stderr,
-                    // "    merging seg %zu (rows_eval=%zu) + seg %zu (rows_eval=%zu) "
-                    // "-> ffaout_total (out_rows=%zu, bins=%zu, f=%.4f)\n",
-                    // i, rows_eval[i], i+1, rows_eval[i+1], total_rows_eval, bins, f);
-                // fflush(stderr);
-                merge_gappy(ConstBlock(ffaout_mem[i].get(), rows_eval[i], bins),
-                      ConstBlock(ffaout_mem[i+1].get(), rows_eval[i+1], bins),
-                      Block(ffaout_total.get(), total_rows_eval, bins));
-                // fprintf(stderr, "    merged seg %zu and %zu OK\n", i, i+1);
-                // fflush(stderr);
-                }
-
-            // Dump the merged transform for the same iteration as the segments.
-            // if (dump_this_iter)
-            //     {
-            //     char path[256];
-            //     snprintf(path, sizeof(path),
-            //         "debug_ffaout_total_r%zu_c%zu.bin", total_rows_eval, bins);
-            //     dump_block_bin(path, ffaout_total.get(), total_rows_eval, bins);
-            //     }
-
-            // Noise level of the merged profile. Each phase bin of the merged
-            // transform is the sum of the real (non-gap) samples that fall in
-            // it; the zero-padded gaps contribute no noise. So the number of
-            // samples summed per bin is the sum of the per-segment row counts,
-            // NOT total_rows (which would wrongly count the gaps).
-            size_t merged_rows = 0;
-            for (size_t i = 0; i < num_data; ++i)
-                merged_rows += rows[i];
-            const float stdnoise_total =
-                sqrt(merged_rows * downsampled_variance(total_size, f));
-
-            // Evaluate S/N of the merged profiles for every trial width.
-            auto block = ConstBlock(ffaout_total.get(), total_rows_eval, bins);
-            // fprintf(stderr, "  [ds %zu bins %zu] snr2: rows=%zu bins=%zu num_widths=%zu stdnoise_total=%f -> writes %zu floats\n",
-                // ids, bins, total_rows_eval, bins, num_widths, stdnoise_total, total_rows_eval * num_widths);
-            // fflush(stderr);
-            snr2(block, widths, num_widths, stdnoise_total, snr);
-            // fprintf(stderr, "  [ds %zu bins %zu] snr2 OK\n", ids, bins);
-            // fflush(stderr);
-
-            // Record the trial period and number of phase bins for each of the
-            // evaluated rows. The period spacing is set by total_rows, the full
-            // height of the merged transform (matching periodogram()).
-            for (size_t s = 0; s < total_rows_eval; ++s)
-                {
-                periods[s] = tau * bins * bins / (bins - s / (total_rows - 1.0));
+                periods[s] = tau * bins * bins / (bins - s / (rows - 1.0));
                 foldbins[s] = bins;
                 }
-            // fprintf(stderr, "  [ds %zu bins %zu] wrote %zu periods/foldbins\n",
-                // ids, bins, total_rows_eval);
-            // fflush(stderr);
 
-            // Advance the output pointers past the trials just written.
-            snr += total_rows_eval * num_widths;
-            periods += total_rows_eval;
-            foldbins += total_rows_eval;
-            // fprintf(stderr, "  [ds %zu bins %zu] advanced output pointers (snr+=%zu, periods/foldbins+=%zu)\n",
-                // ids, bins, total_rows_eval * num_widths, total_rows_eval);
-            // fflush(stderr);
+            snr += rows_eval * num_widths;
+            periods += rows_eval;
+            foldbins += rows_eval;
             }
         }
     }
