@@ -23,11 +23,13 @@ import numpy as np
 from riptide import TimeSeries, TimeSeriesGappy, ffa_search, ffa_search_gappy
 import riptide.libcpp as libcpp
 from riptide.ffautils import generate_width_trials
-
+import sys
+sys.setrecursionlimit(10000)
 # Pure-numpy reference port of the C++ periodogram kernels, now shipped inside
 # the package. Used to independently verify the compiled libcpp output, and
 # selectable in ffa_search / ffa_search_gappy via backend="python".
 from riptide import periodogram_py as ppy
+from matplotlib import pyplot as plt
 
 # True period of the injected signal (seconds). The search window is set to
 # +/- 0.2 s around this value.
@@ -71,6 +73,7 @@ def stitch_padded(g, normalise=False):
         if i < len(gaps):
             parts.append(np.zeros(int(gaps[i]), dtype=np.float32))
     data = np.concatenate(parts).astype(np.float32)
+    print(f"  stitched series: nsamp={data.size}  ")
     return TimeSeries(data, g.tsamp, metadata=segs[0].metadata)
 
 
@@ -132,23 +135,47 @@ def normalise_snr(snr):
     return (snr - median) / iqr
 
 
-def demo_generate():
-    banner("1. TimeSeriesGappy.generate: cut a chunk out of the middle")
-    tsamp = 0.01           # 10 ms samples
-    gap_start = 30.0       # gap begins 30 s in
-    gap_length = 30000.0   # 30000 s excised (100x bigger again; 1000x the original 30 s)
-    # length must hold seg0 (gap_start) + the gap + a seg1 of the same size as seg0
-    length = gap_start + gap_length + gap_start  # seconds before the gap is removed
+def demo_generate(nseg=10, seg_length=30.0, tsamp=0.01, base_gap=10.0):
+    banner(f"1. TimeSeriesGappy: {nseg} segments separated by random gaps")
+    # Build ONE long, phase-coherent series spanning the whole timeline (all
+    # segments + all gaps), then cut the gap regions out so the surviving
+    # segments stay phase-coherent across the gaps. Each gap is base_gap + x
+    # seconds, x random in [0, base_gap), so the inter-segment spacings differ.
+    gap_lengths = base_gap + np.random.uniform(0.0, base_gap, size=nseg - 1)  # seconds
 
-    g = TimeSeriesGappy.generate(
-        length=length,
-        tsamp=tsamp,
-        period=TRUE_PERIOD,
-        gap_start=gap_start,
-        gap_length=gap_length,
-        amplitude=20.0,
-        stdnoise=1.0,
+    seg_samples = int(round(seg_length / tsamp))
+    expected_gaps = [int(round(gl / tsamp)) for gl in gap_lengths]
+
+    # Sample offset of each segment's start within the full continuous series.
+    seg_starts = [0]
+    for i in range(1, nseg):
+        seg_starts.append(seg_starts[-1] + seg_samples + expected_gaps[i - 1])
+    total_length = (seg_starts[-1] + seg_samples) * tsamp
+
+    #the amplitude goes like 1/sqrt(nseg) so that the S/N of the combined series is the same as a single segment
+    #set total length amplitude
+    on_segments_total = nseg * seg_length
+    fraction_on = on_segments_total / total_length
+
+    ref_fraction_on = 300/745
+    ref_snr = 20.0
+
+    #if the fraction changes
+    fraction_ratio = ref_fraction_on / fraction_on
+    snr = ref_snr * np.sqrt(fraction_ratio)
+
+    full = TimeSeries.generate(
+        length=total_length, tsamp=tsamp, period=TRUE_PERIOD,
+        amplitude=snr, stdnoise=1.0,
     )
+
+    base_mjd = 58000.0
+    segments = []
+    for start in seg_starts:
+        data = full.data[start:start + seg_samples]
+        mjd = base_mjd + start * tsamp / 86400.0
+        segments.append(TimeSeries(data, tsamp, copy=True, metadata={"mjd": mjd}))
+    g = TimeSeriesGappy(segments)
 
     print(g)
     for i, ts in enumerate(g):
@@ -157,13 +184,11 @@ def demo_generate():
             f"mjd={ts.metadata['mjd']:.8f}"
         )
 
-    expected_gap = int(round(gap_length / tsamp))
-    print(f"\n  gap_samples           = {g.gap_samples}")
-    print(f"  expected gap (samples) = [{expected_gap}]")
-    assert g.gap_samples == [expected_gap], g.gap_samples
-    assert len(g) == 2
-    # Each surviving segment should be (length - gap_length) / 2 long
-    assert g[0].nsamp == int(round(gap_start / tsamp))
+    print(f"\n  gap_samples (expected) = {expected_gaps}")
+    print(f"  gap_samples (actual)   = {g.gap_samples}")
+    assert len(g) == nseg
+    assert g.gap_samples == expected_gaps, (g.gap_samples, expected_gaps)
+    assert all(ts.nsamp == seg_samples for ts in g)
     print("  -> OK")
     return g
 
@@ -567,7 +592,11 @@ def make_plot(g, pgram, individual_pgrams=None, stitched_pgram=None,
         ax_ts.plot(t, ts.data, lw=0.6, label=f"segment {i}")
     ax_ts.set_xlabel("Time since first epoch (s)")
     ax_ts.set_ylabel("Amplitude")
-    ax_ts.set_title(f"TimeSeriesGappy  (gap = {g.gap_samples[0]} samples)")
+    gaps = g.gap_samples
+    ax_ts.set_title(
+        f"TimeSeriesGappy  ({len(g)} segments, "
+        f"gaps = {min(gaps)}-{max(gaps)} samples)"
+    )
     ax_ts.legend()
 
     # Bottom panel: the gappy periodogram with every per-segment periodogram
