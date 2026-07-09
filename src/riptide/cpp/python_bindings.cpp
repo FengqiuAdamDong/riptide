@@ -213,11 +213,16 @@ std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > per
 }
 
 
-std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > periodogram_gappy(
-    std::vector<py::array_t<float>> arr_data_list,
-    py::array_t<size_t> arr_gaps,
+// Shared wrapper for the two gappy periodogram kernels (segment-wise and old
+// zero-padding implementation); 'kernel' is one of riptide::periodogram_gappy
+// or riptide::periodogram_gappy_old.
+template <typename Kernel>
+std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > periodogram_gappy_impl(
+    Kernel kernel,
+    std::vector<py::array_t<float>>& arr_data_list,
+    py::array_t<size_t>& arr_gaps,
     double tsamp,
-    py::array_t<size_t> arr_widths,
+    py::array_t<size_t>& arr_widths,
     double period_min,
     double period_max,
     size_t bins_min,
@@ -264,13 +269,45 @@ std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > per
     auto foldbins = new_cstyle_array<uint32_t>({length});
     auto snrs = new_cstyle_array<float>({length, num_widths});
 
-    riptide::periodogram_gappy(
+    kernel(
         data_ptrs.data(), sizes.data(), gaps_ptr, num_data, tsamp,
         widths.data(0), num_widths, period_min, period_max, bins_min, bins_max,
         periods.mutable_data(0), foldbins.mutable_data(0), snrs.mutable_data(0)
         );
 
     return std::make_tuple(periods, foldbins, snrs);
+}
+
+
+std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > periodogram_gappy(
+    std::vector<py::array_t<float>> arr_data_list,
+    py::array_t<size_t> arr_gaps,
+    double tsamp,
+    py::array_t<size_t> arr_widths,
+    double period_min,
+    double period_max,
+    size_t bins_min,
+    size_t bins_max)
+{
+    return periodogram_gappy_impl(
+        &riptide::periodogram_gappy, arr_data_list, arr_gaps, tsamp, arr_widths,
+        period_min, period_max, bins_min, bins_max);
+}
+
+
+std::tuple< py::array_t<double>, py::array_t<uint32_t>, py::array_t<float> > periodogram_gappy_old(
+    std::vector<py::array_t<float>> arr_data_list,
+    py::array_t<size_t> arr_gaps,
+    double tsamp,
+    py::array_t<size_t> arr_widths,
+    double period_min,
+    double period_max,
+    size_t bins_min,
+    size_t bins_max)
+{
+    return periodogram_gappy_impl(
+        &riptide::periodogram_gappy_old, arr_data_list, arr_gaps, tsamp, arr_widths,
+        period_min, period_max, bins_min, bins_max);
 }
 
 
@@ -341,7 +378,18 @@ PYBIND11_MODULE(libcpp, m)
         "Compute the periodogram of a gappy time series, made of several non-contiguous segments.\n"
         "'data_list' is a list of 1D float32 arrays (one normalised segment each), and 'gaps' is an\n"
         "array of num_segments - 1 sample counts giving the number of missing samples between\n"
-        "consecutive segments. Returns a 3-tuple of arrays: trial periods, number of phase bins, S/N."
+        "consecutive segments. Returns a 3-tuple of arrays: trial periods, number of phase bins, S/N.\n"
+        "Each segment is downsampled and FFA-transformed on its own, and the transforms are merged\n"
+        "across the gaps; the zero-padded series is never materialised."
+    );
+
+    m.def(
+        "periodogram_gappy_old", &periodogram_gappy_old,
+        py::arg("data_list"), py::arg("gaps"), py::arg("tsamp"), py::arg("widths"), py::arg("period_min"), py::arg("period_max"), py::arg("bins_min"), py::arg("bins_max"),
+        "Old implementation of periodogram_gappy, kept for comparison: FFA-transforms the whole\n"
+        "zero-padded series (skipping all-zero gap sub-blocks), bit-for-bit identical to\n"
+        "periodogram() run on the zero-padded series. Same arguments and outputs as\n"
+        "periodogram_gappy."
     );
 
     m.def(

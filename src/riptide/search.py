@@ -18,6 +18,8 @@ _PERIODOGRAM_BACKENDS = {
 }
 _PERIODOGRAM_GAPPY_BACKENDS = {
     "cpp": libcpp.periodogram_gappy,
+    # old zero-padding kernel, kept for comparison against the segment-wise one
+    "cpp_old": libcpp.periodogram_gappy_old,
     "python": periodogram_py.periodogram_gappy,
 }
 
