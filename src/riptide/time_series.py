@@ -150,7 +150,7 @@ class TimeSeries(object):
                 metadata=self.metadata,
             )
 
-    def fold(self, period, bins, subints=None):
+    def fold(self, period, bins, subints=None, epoch=None):
         """
         Fold TimeSeries at given period.
 
@@ -164,6 +164,14 @@ class TimeSeries(object):
             Number of desired sub-integrations. If None, the number of
             sub-integrations will be the number of full periods that fit in
             the data
+        epoch : float or None, optional
+            Reference folding epoch, as an MJD. It can be arbitrarily far in
+            the past or future relative to the data: only its value modulo
+            'period' matters. Requires an 'mjd' key in self.metadata giving
+            the epoch of the first sample. At most one period's worth of
+            data is discarded from the start so that the fold is
+            phase-coherent with 'epoch'. If None, the fold starts at the
+            first sample (default: None)
 
         Returns
         -------
@@ -171,7 +179,7 @@ class TimeSeries(object):
             The folded data as a numpy array. If subints > 1, it has a shape
             (subints, bins). Otherwise it is a 1D array with 'bins' elements.
         """
-        return fold(self, period, bins, subints=subints)
+        return fold(self, period, bins, subints=subints, epoch=epoch)
 
     @classmethod
     def generate(

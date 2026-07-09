@@ -3,7 +3,7 @@ import tempfile
 
 import numpy as np
 from pytest import raises, warns
-from riptide import TimeSeries, save_json, load_json
+from riptide import TimeSeries, Metadata, save_json, load_json
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -202,6 +202,70 @@ def test_methods():
     # Period too short
     with raises(ValueError):
         Xerr = tsorig.fold(1.0e-6, bins, subints=None)
+
+
+def test_fold_epoch():
+    """
+    Check that folding two segments of the same underlying periodic signal,
+    with a shared reference 'epoch', produces phase-coherent profiles: the
+    signal peak lands on the same phase bin in both, regardless of where
+    each segment starts. Also check that this holds even when 'epoch' is
+    arbitrarily far away (only its value modulo 'period' matters), and that
+    omitting 'epoch' breaks this coherence.
+    """
+    length = 20.0  # s, i.e. 20 signal periods
+    tsamp = 1.0e-3  # s
+    period = 1.0  # s
+    bins = 200
+    phi0 = 0.37
+    ducy = 0.05
+    amplitude = 50.0
+    mjd0 = 60000.0
+
+    full = TimeSeries.generate(
+        length, tsamp, period, phi0=phi0, ducy=ducy, amplitude=amplitude, stdnoise=0.0
+    )
+
+    # Arbitrary cut point, deliberately NOT a multiple of the period, so that
+    # the two segments start at different signal phases.
+    istart = 13425
+    assert istart % int(round(period / tsamp)) != 0
+
+    meta_before = Metadata({**dict(full.metadata), "mjd": mjd0})
+    meta_after = Metadata(
+        {**dict(full.metadata), "mjd": mjd0 + istart * tsamp / 86400.0}
+    )
+    before = TimeSeries(full.data[:istart], tsamp, copy=True, metadata=meta_before)
+    after = TimeSeries(full.data[istart:], tsamp, copy=True, metadata=meta_after)
+
+    # Folded with a common reference epoch, both segments' peaks should land
+    # on (near enough) the same phase bin.
+    prof_before = before.fold(period, bins, subints=1, epoch=mjd0)
+    prof_after = after.fold(period, bins, subints=1, epoch=mjd0)
+    peak_before = int(np.argmax(prof_before))
+    peak_after = int(np.argmax(prof_after))
+    assert abs(peak_before - peak_after) <= 1
+
+    # Without a shared epoch, the 'after' segment folds starting at its own
+    # first sample, which is out of phase with 'before': the peak should
+    # land on a noticeably different bin.
+    prof_after_noepoch = after.fold(period, bins, subints=1)
+    peak_after_noepoch = int(np.argmax(prof_after_noepoch))
+    assert abs(peak_before - peak_after_noepoch) > 10
+
+    # The reference epoch can be arbitrarily far in the past or future:
+    # only its value modulo 'period' matters.
+    epoch_far_past = mjd0 - 1.0e6 * period / 86400.0
+    epoch_far_future = mjd0 + 1.0e6 * period / 86400.0
+    prof_far_past = before.fold(period, bins, subints=1, epoch=epoch_far_past)
+    prof_far_future = before.fold(period, bins, subints=1, epoch=epoch_far_future)
+    assert np.allclose(prof_before, prof_far_past, atol=FLOAT_ATOL)
+    assert np.allclose(prof_before, prof_far_future, atol=FLOAT_ATOL)
+
+    # 'epoch' requires an 'mjd' entry in the metadata
+    no_mjd = TimeSeries(full.data, tsamp)
+    with raises(ValueError):
+        no_mjd.fold(period, bins, epoch=mjd0)
 
 
 def test_serialization():

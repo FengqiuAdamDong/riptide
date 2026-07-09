@@ -18,7 +18,7 @@ def downsample_vertical(X, factor):
     return np.ascontiguousarray(out.T)
 
 
-def fold(ts, period, bins, subints=None):
+def fold(ts, period, bins, subints=None, epoch=None):
     """
     Fold TimeSeries at given period
 
@@ -34,6 +34,15 @@ def fold(ts, period, bins, subints=None):
         Number of desired sub-integrations. If None, the number of
         sub-integrations will be the number of full periods that fit in
         the data (default: None)
+    epoch : float or None, optional
+        Reference folding epoch, as an MJD. It can be arbitrarily far in the
+        past or future relative to the data: only its value modulo 'period'
+        matters. If given, ``ts.metadata`` must contain an 'mjd' key giving
+        the epoch of the first sample of 'ts'. At most one period's worth of
+        data is discarded from the start of 'ts' so that the fold is made
+        phase-coherent with 'epoch', i.e. phase bin 0 of the output aligns
+        with phase 0 of a fold referenced to 'epoch'. If None, the fold
+        starts at the first sample of 'ts' (default: None)
 
     Returns
     -------
@@ -45,8 +54,41 @@ def fold(ts, period, bins, subints=None):
     ------
     ValueError: if the data cannot be folded with the requested parameters,
     e.g. bin width is shorter than sampling time, or subint length is shorter
-    than requested period
+    than requested period, or not enough data is left after aligning the
+    fold with 'epoch'
     """
+    if epoch is not None:
+        mjd = ts.metadata.get("mjd")
+        if mjd is None:
+            raise ValueError(
+                "ts.metadata must contain an 'mjd' epoch in order to fold "
+                "with a reference 'epoch'"
+            )
+
+        # Time elapsed between 'epoch' and the start of the data, in seconds.
+        # This can be arbitrarily large in magnitude (or negative): only its
+        # value modulo 'period' matters to align the fold's phase 0 with
+        # 'epoch'.
+        dt = (mjd - epoch) * 86400.0
+        skip = (-dt) % period
+        period_samples = int(round(period / ts.tsamp))
+        # Rounding 'skip' to the nearest sample can push it up to a full
+        # period's worth of samples if it lies within half a sample of
+        # 'period' (which floating-point cancellation can easily produce for
+        # an 'epoch' far away from the data). Wrap it back down: that edge
+        # case is equivalent to no skip at all.
+        skip_samples = int(round(skip / ts.tsamp)) % period_samples
+
+        if skip_samples >= ts.nsamp:
+            raise ValueError(
+                "not enough data to align the fold with the requested "
+                "'epoch': the data span is shorter than the phase offset "
+                "between its start and 'epoch'"
+            )
+
+        if skip_samples:
+            ts = type(ts)(ts.data[skip_samples:], ts.tsamp, metadata=ts.metadata)
+
     if period > ts.length:
         raise ValueError("Period exceeds data length")
 
