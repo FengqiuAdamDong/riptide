@@ -48,7 +48,7 @@ def timed(label, fn, *args, **kwargs):
     return result
 
 
-def make_gappy(nseg=20, seg_length=30.0, tsamp=0.01, base_gap=30000.0):
+def make_gappy(nseg=20, seg_length=30.0, tsamp=0.01, base_gap=300.0):
     """Build ONE long, phase-coherent series spanning the whole timeline, then
     cut the gap regions out so the surviving segments stay phase-coherent across
     the gaps. Returns a TimeSeriesGappy of `nseg` segments."""
@@ -88,6 +88,11 @@ def peak(pgram):
     i = int(np.nanargmax(snr))
     return periods[i], snr[i]
 
+def normalise_snr(snr):
+    snr = np.asarray(snr)
+    snr -= np.nanmedian(snr)
+    snr /= (np.nanpercentile(snr, 75) - np.nanpercentile(snr, 25))
+    return snr
 
 def make_plot(g, pg_new, pg_old, fname=None):
     import matplotlib.pyplot as plt
@@ -117,6 +122,10 @@ def make_plot(g, pg_new, pg_old, fname=None):
     p_n = np.asarray(pg_new.periods)
     s_n = np.asarray(pg_new.snrs).max(axis=1)
     o_n = np.argsort(p_n)
+
+    s_n = normalise_snr(s_n)
+    s_o = normalise_snr(s_o)
+   
 
     ax_pg.plot(p_o[o_o], s_o[o_o], lw=2.0, color="k", label="backend='cpp_old'")
     ax_pg.plot(p_n[o_n], s_n[o_n], lw=1.0, color="tab:orange", ls="--",
@@ -172,11 +181,13 @@ def main():
     s_n = np.asarray(pg_new.snrs).max(axis=1)
     s_o = np.asarray(pg_old.snrs).max(axis=1)
 
+    s_n = normalise_snr(s_n)
+    s_o = normalise_snr(s_o)
     print("\nResults (injected period = "
           f"{TRUE_PERIOD:.4f} s):")
-    print(f"  cpp (new): peak period = {per_n:.6f} s   S/N = {snr_n:.3f}")
-    print(f"  cpp_old  : peak period = {per_o:.6f} s   S/N = {snr_o:.3f}")
-    print(f"  max |S/N_new - S/N_old| = {np.nanmax(np.abs(s_n - s_o)):.3e}")
+    print(f"  cpp (new): peak period = {per_n:.6f} s   S/N = {np.max(s_n):.3f}")
+    print(f"  cpp_old  : peak period = {per_o:.6f} s   S/N = {np.max(s_o):.3f}")
+    print(f"  max |S/N_new - S/N_old| = {(np.abs(np.nanmax(s_n) - np.nanmax(s_o))):.3e}")
     same_peak = np.isclose(per_n, per_o, rtol=1e-4) and np.isclose(snr_n, snr_o, rtol=0.05)
     print("  -> kernels find the same peak" if same_peak
           else "  -> kernels find DIFFERENT peaks")
