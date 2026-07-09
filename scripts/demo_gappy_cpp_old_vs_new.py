@@ -48,7 +48,7 @@ def timed(label, fn, *args, **kwargs):
     return result
 
 
-def make_gappy(nseg=5, seg_length=30.0, tsamp=0.01, base_gap=3000.0):
+def make_gappy(nseg=20, seg_length=30.0, tsamp=0.01, base_gap=30000.0):
     """Build ONE long, phase-coherent series spanning the whole timeline, then
     cut the gap regions out so the surviving segments stay phase-coherent across
     the gaps. Returns a TimeSeriesGappy of `nseg` segments."""
