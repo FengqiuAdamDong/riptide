@@ -19,6 +19,7 @@ It is NOT meant to be fast - it mirrors the C++ control flow (explicit loops)
 for clarity and bit-level fidelity, not performance.
 """
 import math
+import time
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -393,6 +394,10 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
 
     periods, foldbins, snr_blocks = [], [], []
 
+    # accumulated wall time per section, printed at the end
+    timers = {"downsample": 0.0, "extract_rows": 0.0, "transform": 0.0,
+              "merge_gappy": 0.0, "snr": 0.0}
+
     for ids in range(num_downsamplings):
         # print(ids)
         f = ds_ini * ds_geo ** ids
@@ -423,7 +428,9 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
         # materialised -- the per-segment blocks below are assembled from the
         # pieces directly. The gap edges computed above index into this same
         # virtual downsampled array.
+        t0 = time.perf_counter()
         ds_segs, ds_starts = downsample_gappy(data_list, gaps, f)
+        timers["downsample"] += time.perf_counter() - t0
         bstop = min(bins_max, n, int(period_max_samples))
         for bins in range(bins_min, bstop + 1):
             # print(bins)
@@ -464,14 +471,19 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
                     if s < e:
                         block[s - lo:e - lo] += arr[s - k0:e - k0]
                 return block.reshape(r1 - r0, bins)
-
             #FFA each segment's block of rows; the pure-gap rows between
             #blocks are never materialised
             ffa_arr = []
             for i in range(num_data):
                 r0 = 0 if i == 0 else gap_rows_ends[i - 1]
                 r1 = gap_rows_starts[i] if i < num_data - 1 else rows
-                ffa_arr.append(transform(extract_rows(r0, r1)))
+                t0 = time.perf_counter()
+                inp_block = extract_rows(r0, r1)
+                t1 = time.perf_counter()
+                ffa_arr.append(transform(inp_block))
+                t2 = time.perf_counter()
+                timers["extract_rows"] += t1 - t0
+                timers["transform"] += t2 - t1
             # ffa_arr = np.array(ffa_arr, dtype=np.float32)
             #ffa_arr contains the transformed inp_block
             def merge_gappy(ffa_arr, gap_rows_starts, gap_rows_ends, rows):
@@ -506,7 +518,10 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
                 #     b = s - (h + t)
                 #     out[s] = fused_rollback_add(thead[h], ttail[t], h + b)
                 # return out
+        
+            t0 = time.perf_counter()
             ffa_merged = merge_gappy(ffa_arr, gap_rows_starts, gap_rows_ends, rows)
+            timers["merge_gappy"] += time.perf_counter() - t0
             # plt.figure()
             # plt.imshow(ffa_merged-ffa_orig, aspect='auto', origin='lower')
             # plt.colorbar(label='FFA difference (merged - original)')
@@ -519,8 +534,10 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             # plt.show()
             # import pdb; pdb.set_trace()
             
+            t0 = time.perf_counter()
             snr_blocks.append(snr2(ffa_merged[:rows_eval], widths, stdnoise))
-            
+            timers["snr"] += time.perf_counter() - t0
+
 
 
 
@@ -528,6 +545,13 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             for s in range(rows_eval):
                 periods.append(tau * bins * bins / (bins - s / (rows - 1.0)))
                 foldbins.append(bins)
+
+    total = sum(timers.values())
+    print("periodogram_gappy section timings:")
+    for name, t in timers.items():
+        pct = f"  ({100.0 * t / total:5.1f} %)" if total > 0 else ""
+        print(f"  {name:<12s} {t:8.3f} s{pct}")
+    print(f"  {'total':<12s} {total:8.3f} s")
 
     periods = np.asarray(periods, dtype=np.float64)
     foldbins = np.asarray(foldbins, dtype=np.uint32)
