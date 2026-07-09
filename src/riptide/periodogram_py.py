@@ -71,6 +71,65 @@ def downsample(data, f):
     return out
 
 
+def downsample_gappy(data_list, gaps, f):
+    """Downsample a gappy series by a real-valued factor f, touching only the
+    real samples.
+
+    Equivalent to downsample() applied to the fully zero-padded series
+    (seg0 | zeros(gap0) | seg1 | ...): each segment is zero-padded out to the
+    enclosing global window boundaries and downsampled with the global window
+    phase, then added into a zeros output array. Because window starts are
+    computed as (k_first + k) * f - a (the identical float64 product the
+    whole-array code would form, minus an exactly-representable integer), and
+    the zero padding adds exact 0.0f into the float32 accumulator, every
+    window that overlaps a single segment is bitwise identical to the
+    whole-array result. Only a window straddling two segments across a gap
+    smaller than f can differ, by ~1 ulp, since each segment's partial sum is
+    rounded before the '+='.
+    """
+    data_list = [np.asarray(d, dtype=F32) for d in data_list]
+    sizes = [d.size for d in data_list]
+    gaps = [int(g) for g in np.asarray(gaps).ravel()]
+    size = sum(sizes) + sum(gaps)
+    if f == 1:
+        out = np.zeros(size, dtype=F32)
+        for i, seg in enumerate(data_list):
+            start = sum(sizes[:i]) + sum(gaps[:i])
+            out[start:start + sizes[i]] = seg
+        return out
+    n = downsampled_size(size, f)
+    out = np.zeros(n, dtype=F32)
+    for i, seg in enumerate(data_list):
+        S = sum(sizes[:i]) + sum(gaps[:i])  # global raw start of segment
+        E = S + sizes[i]                    # global raw end (exclusive)
+        # window k spans global [k*f, (k+1)*f); those overlapping [S, E):
+        k_first = int(math.floor(S / f))
+        k_last = min(n - 1, int(math.ceil(E / f)) - 1)
+        if k_last < k_first:  # segment lies past the last complete window
+            continue
+        a = int(math.floor(k_first * f))  # first raw index any window reads
+        b = min(int(math.floor((k_last + 1) * f)), size - 1)  # last raw index read
+        seg_pad = np.zeros(b - a + 1, dtype=F32)
+        # tail samples past b are read by no window (the whole-array
+        # downsample ignores them too); only the last segment can hit this
+        stop = min(E, b + 1)
+        seg_pad[S - a:stop - a] = seg[:stop - S]
+        Nloc = seg_pad.size
+        for k in range(k_last - k_first + 1):
+            start = (k_first + k) * f - a
+            end = start + f
+            imin = int(math.floor(start))
+            imax = int(min(math.floor(end), Nloc - 1.0))
+            wmin = F32((imin + 1) - start)
+            wmax = F32(end - imax)
+            acc = wmin * seg_pad[imin]
+            for j in range(imin + 1, imax):
+                acc = F32(acc + seg_pad[j])
+            acc = F32(acc + wmax * seg_pad[imax])
+            out[k_first + k] += acc
+    return out
+
+
 # ---------------------------------------------------------------------------
 # kernels.hpp
 # ---------------------------------------------------------------------------
@@ -323,14 +382,6 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
     gaps = [int(g) for g in np.asarray(gaps).ravel()]
     size = sum(sizes) + sum(gaps)
     _check_arguments(size, tsamp, period_min, period_max, bins_min, bins_max)
-    #make a new data array and pad with the gaps
-    data = np.zeros(size, dtype=F32)
-    for i in range(num_data):
-        if i == 0:
-            data[:sizes[i]] = data_list[i]
-        else:
-            start = sum(sizes[:i]) + sum(gaps[:i])
-            data[start:start + sizes[i]] = data_list[i]
 
     print("Data size:", size)
     ds_ini = period_min / (tsamp * bins_min)
@@ -352,7 +403,8 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
         # output index downsampled_size(P, f). Compute the gap edges from the
         # cumulative raw positions rather than summing per-segment downsampled
         # sizes -- floor(a/f) + floor(b/f) != floor((a+b)/f), and only the
-        # whole-array mapping is consistent with inp = downsample(data, f).
+        # whole-array mapping is consistent with the downsampled array below
+        # (downsample_gappy reproduces the whole-array downsample bitwise).
         gap_start_indexes = []
         gap_end_indexes = []
         for i in range(len(gaps)):
@@ -361,10 +413,11 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             gap_end_indexes.append(downsampled_size(raw_seg_end + gaps[i], f))
 
 
-        # Downsample the full zero-padded array as a single unit, exactly as
-        # demo_gappy_timeseries.py does for its zero-pad ground truth. The gap
-        # edges computed above index into this same downsampled array.
-        inp = data if f == 1 else downsample(data, f)
+        # Downsample each segment on the global window grid and drop the
+        # results into a zeros array -- bitwise equivalent to downsampling the
+        # full zero-padded series, but skipping the gaps. The gap edges
+        # computed above index into this same downsampled array.
+        inp = downsample_gappy(data_list, gaps, f)
         #plot to verify
         # plt.figure()
         # plt.plot(inp, label='data')
@@ -396,7 +449,7 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             #     gap_row_start = gap_start_indexes[i] // bins
             #     gap_row_end = gap_end_indexes[i] // bins
             #     gap_rows.extend(range(gap_row_start+1, gap_row_end))
-
+            
             ffa_arr = []
             # gap_rows = np.array(gap_rows, dtype=np.int32)
             # ffa_orig = transform_gappy(inp[:rows * bins].reshape(rows, bins),gap_rows)
