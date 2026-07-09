@@ -384,14 +384,86 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             #add one to the start subtract one from the end to get the rows that are in the gap
             gap_rows_starts = [(g // bins)+1 for g in gap_start_indexes]
             gap_rows_ends = [(g // bins)-1 for g in gap_end_indexes]
-            for i in range(len(gap_start_indexes)):
-                gap_row_start = gap_start_indexes[i] // bins
-                gap_row_end = gap_end_indexes[i] // bins
-                gap_rows.extend(range(gap_row_start+1, gap_row_end))
+            # If a gap spans fewer than ~2 rows (short gap and/or heavy
+            # downsampling), gap_rows_ends < gap_rows_starts and the segment
+            # slices below would overlap, double-counting the boundary rows in
+            # the merge. Clamp the gap end up to the gap start so the two
+            # segments are treated as contiguous (the merge then spans no
+            # virtual gap rows).
+            gap_rows_ends = [max(e, s) for s, e in
+                             zip(gap_rows_starts, gap_rows_ends)]
+            # for i in range(len(gap_start_indexes)):
+            #     gap_row_start = gap_start_indexes[i] // bins
+            #     gap_row_end = gap_end_indexes[i] // bins
+            #     gap_rows.extend(range(gap_row_start+1, gap_row_end))
 
-            gap_rows = np.array(gap_rows, dtype=np.int32)
-            ffa = transform_gappy(inp[:rows * bins].reshape(rows, bins),gap_rows)
-            snr_blocks.append(snr2(ffa[:rows_eval], widths, stdnoise))
+            ffa_arr = []
+            # gap_rows = np.array(gap_rows, dtype=np.int32)
+            # ffa_orig = transform_gappy(inp[:rows * bins].reshape(rows, bins),gap_rows)
+            #try to produce FFA and merge in a faster way by FFAing each segment and then merging the FFA results, ignoring the gaps
+            ffa_arr = []
+
+            for i in range(num_data):
+                #first grab the input block of each segment
+                if i==0:
+                    inp_block = inp[:rows * bins].reshape(rows, bins)[:gap_rows_starts[i]]
+                elif i<num_data-1:
+                    inp_block = inp[:rows * bins].reshape(rows, bins)[gap_rows_ends[i-1]:gap_rows_starts[i]]
+                else:
+                    inp_block = inp[:rows * bins].reshape(rows, bins)[gap_rows_ends[i-1]:]
+                ffa_arr.append(transform(inp_block))
+            # ffa_arr = np.array(ffa_arr, dtype=np.float32)
+            #ffa_arr contains the transformed inp_block
+            def merge_gappy(ffa_arr, gap_rows_starts, gap_rows_ends, rows):
+                #ffa_arr is an array of ffa for each of the segments that was transformed
+                #gap_rows_starts and gap_rows_ends are the start and end of the gaps in the rows, as lists of ints
+                #rows is the total number of rows, always a int
+                for i in range(len(gap_rows_starts)):
+                    #iteratively merge from the start to the end, the first merge should be the first segment and the second segment,
+                    #the resultant number of rows is therefore gap_rows_ends[i] + ffa_arr[i+1].shape[0]
+                    if i==0:
+                        out_merge = merge(ffa_arr[i], ffa_arr[i+1], gap_rows_ends[i] + ffa_arr[i+1].shape[0])
+                    else:
+                        #for every successive merge, merge the last output with the next segment,
+                        #the number of rows is the same as before
+                        out_merge = merge(out_merge, ffa_arr[i+1], gap_rows_ends[i] + ffa_arr[i+1].shape[0])
+                return out_merge
+
+
+                # thead = np.asarray(thead, dtype=F32)
+                # ttail = np.asarray(ttail, dtype=F32)
+                # m = out_rows
+                # p = thead.shape[1]
+                # out = np.empty((m, p), dtype=F32)
+                # kh = F32((thead.shape[0] - 1.0) / (m - 1.0)) if m > 1 else F32(0.0)
+                # kt = F32((ttail.shape[0] - 1.0) / (m - 1.0)) if m > 1 else F32(0.0)
+                # for s in range(m):
+                #     # NOTE: keep this arithmetic in strict float32 to reproduce the C++
+                #     # rounding of 'kh * s + 0.5f'. numpy promotes float32 * python-int to
+                #     # float64, which would round differently and shift rows by one.
+                #     h = int(kh * F32(s) + F32(0.5))
+                #     t = int(kt * F32(s) + F32(0.5))
+                #     b = s - (h + t)
+                #     out[s] = fused_rollback_add(thead[h], ttail[t], h + b)
+                # return out
+            ffa_merged = merge_gappy(ffa_arr, gap_rows_starts, gap_rows_ends, rows)
+            # plt.figure()
+            # plt.imshow(ffa_merged-ffa_orig, aspect='auto', origin='lower')
+            # plt.colorbar(label='FFA difference (merged - original)')
+            # plt.figure()
+            # plt.imshow(ffa_merged, aspect='auto', origin='lower')
+            # plt.colorbar(label='FFA merged')
+            # plt.figure()
+            # plt.imshow(ffa_orig, aspect='auto', origin='lower')
+            # plt.colorbar(label='FFA original')
+            # plt.show()
+            # import pdb; pdb.set_trace()
+            
+            snr_blocks.append(snr2(ffa_merged[:rows_eval], widths, stdnoise))
+            
+
+
+
 
             for s in range(rows_eval):
                 periods.append(tau * bins * bins / (bins - s / (rows - 1.0)))
