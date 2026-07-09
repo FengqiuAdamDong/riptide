@@ -4,9 +4,11 @@ Show that downsample_gappy() is EXACTLY equivalent to zero-padding a gappy
 series and running downsample() on the whole padded array.
 
 downsample_gappy downsamples each segment individually (padded with a handful
-of zeros so its windows align with the global downsample grid) and drops the
-results into a zeros array, skipping the gaps entirely. Every comparison below
-is checked with np.array_equal, i.e. bitwise equality of the float32 outputs.
+of zeros so its windows align with the global downsample grid) and returns the
+per-segment pieces plus their global offsets, skipping the gaps entirely.
+Adding the pieces into a zeros array of the downsampled length must reproduce
+downsample(zero_padded) exactly. Every comparison below is checked with
+np.array_equal, i.e. bitwise equality of the float32 outputs.
 
 Run from anywhere (riptide must be importable):
 
@@ -35,6 +37,14 @@ def zero_padded(data_list, gaps):
     return data
 
 
+def assemble(ds_segs, ds_starts, n):
+    """Add the per-segment downsampled pieces into a zeros array of length n."""
+    out = np.zeros(n, dtype=F32)
+    for arr, k0 in zip(ds_segs, ds_starts):
+        out[k0:k0 + arr.size] += arr
+    return out
+
+
 def compare(segs, gaps, f, label=""):
     """Run both paths; return True iff outputs are bitwise identical."""
     full = zero_padded(segs, gaps)
@@ -42,7 +52,7 @@ def compare(segs, gaps, f, label=""):
     t0 = time.perf_counter()
     ref = full if f == 1 else downsample(full, f)
     t1 = time.perf_counter()
-    got = downsample_gappy(segs, gaps, f)
+    got = assemble(*downsample_gappy(segs, gaps, f), ref.size)
     t2 = time.perf_counter()
 
     equal = np.array_equal(ref, got)
@@ -93,7 +103,7 @@ def main():
             continue
         tested += 1
         ref = downsample(full, f)
-        got = downsample_gappy(segs, gaps, f)
+        got = assemble(*downsample_gappy(segs, gaps, f), ref.size)
         if not np.array_equal(ref, got):
             failures += 1
             ok = False

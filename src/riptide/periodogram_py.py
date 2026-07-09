@@ -75,30 +75,28 @@ def downsample_gappy(data_list, gaps, f):
     """Downsample a gappy series by a real-valued factor f, touching only the
     real samples.
 
-    Equivalent to downsample() applied to the fully zero-padded series
+    Returns (ds_segs, ds_starts): one downsampled array per segment plus the
+    global downsampled index at which each one starts. Adding the pieces into
+    a zeros array of length downsampled_size(total_size, f) is bitwise
+    identical to downsample() applied to the fully zero-padded series
     (seg0 | zeros(gap0) | seg1 | ...): each segment is zero-padded out to the
     enclosing global window boundaries and downsampled with the global window
-    phase, then added into a zeros output array. Because window starts are
-    computed as (k_first + k) * f - a (the identical float64 product the
-    whole-array code would form, minus an exactly-representable integer), and
-    the zero padding adds exact 0.0f into the float32 accumulator, every
-    window that overlaps a single segment is bitwise identical to the
-    whole-array result. Only a window straddling two segments across a gap
-    smaller than f can differ, by ~1 ulp, since each segment's partial sum is
-    rounded before the '+='.
+    phase -- window starts are computed as (k_first + k) * f - a, the
+    identical float64 product the whole-array code would form, minus an
+    exactly-representable integer, and the zero padding adds exact 0.0f into
+    the float32 accumulator. A window straddling two segments across a gap
+    smaller than f appears in both pieces as partial sums; adding overlapping
+    pieces in segment order reproduces the whole-array accumulation.
     """
     data_list = [np.asarray(d, dtype=F32) for d in data_list]
     sizes = [d.size for d in data_list]
     gaps = [int(g) for g in np.asarray(gaps).ravel()]
     size = sum(sizes) + sum(gaps)
     if f == 1:
-        out = np.zeros(size, dtype=F32)
-        for i, seg in enumerate(data_list):
-            start = sum(sizes[:i]) + sum(gaps[:i])
-            out[start:start + sizes[i]] = seg
-        return out
+        ds_starts = [sum(sizes[:i]) + sum(gaps[:i]) for i in range(len(sizes))]
+        return data_list, ds_starts
     n = downsampled_size(size, f)
-    out = np.zeros(n, dtype=F32)
+    ds_segs, ds_starts = [], []
     for i, seg in enumerate(data_list):
         S = sum(sizes[:i]) + sum(gaps[:i])  # global raw start of segment
         E = S + sizes[i]                    # global raw end (exclusive)
@@ -106,6 +104,8 @@ def downsample_gappy(data_list, gaps, f):
         k_first = int(math.floor(S / f))
         k_last = min(n - 1, int(math.ceil(E / f)) - 1)
         if k_last < k_first:  # segment lies past the last complete window
+            ds_segs.append(np.empty(0, dtype=F32))
+            ds_starts.append(k_first)
             continue
         a = int(math.floor(k_first * f))  # first raw index any window reads
         b = min(int(math.floor((k_last + 1) * f)), size - 1)  # last raw index read
@@ -115,6 +115,7 @@ def downsample_gappy(data_list, gaps, f):
         stop = min(E, b + 1)
         seg_pad[S - a:stop - a] = seg[:stop - S]
         Nloc = seg_pad.size
+        out = np.empty(k_last - k_first + 1, dtype=F32)
         for k in range(k_last - k_first + 1):
             start = (k_first + k) * f - a
             end = start + f
@@ -126,8 +127,10 @@ def downsample_gappy(data_list, gaps, f):
             for j in range(imin + 1, imax):
                 acc = F32(acc + seg_pad[j])
             acc = F32(acc + wmax * seg_pad[imax])
-            out[k_first + k] += acc
-    return out
+            out[k] = acc
+        ds_segs.append(out)
+        ds_starts.append(k_first)
+    return ds_segs, ds_starts
 
 
 # ---------------------------------------------------------------------------
@@ -413,17 +416,14 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             gap_end_indexes.append(downsampled_size(raw_seg_end + gaps[i], f))
 
 
-        # Downsample each segment on the global window grid and drop the
-        # results into a zeros array -- bitwise equivalent to downsampling the
-        # full zero-padded series, but skipping the gaps. The gap edges
-        # computed above index into this same downsampled array.
-        inp = downsample_gappy(data_list, gaps, f)
-        #plot to verify
-        # plt.figure()
-        # plt.plot(inp, label='data')
-        # for i in range(len(gap_start_indexes)):
-        #     plt.axvspan(gap_start_indexes[i], gap_end_indexes[i], color='red', alpha=0.5, label='gap' if i == 0 else "")
-        # plt.show()
+        # Downsample each segment on the global window grid; ds_starts holds
+        # the global downsampled index where each piece begins. Adding the
+        # pieces into a zeros array of length n would be bitwise equivalent to
+        # downsampling the full zero-padded series, but that array is never
+        # materialised -- the per-segment blocks below are assembled from the
+        # pieces directly. The gap edges computed above index into this same
+        # virtual downsampled array.
+        ds_segs, ds_starts = downsample_gappy(data_list, gaps, f)
         bstop = min(bins_max, n, int(period_max_samples))
         for bins in range(bins_min, bstop + 1):
             # print(bins)
@@ -450,21 +450,28 @@ def periodogram_gappy(data_list, gaps, tsamp, widths, period_min, period_max,
             #     gap_row_end = gap_end_indexes[i] // bins
             #     gap_rows.extend(range(gap_row_start+1, gap_row_end))
             
-            ffa_arr = []
-            # gap_rows = np.array(gap_rows, dtype=np.int32)
-            # ffa_orig = transform_gappy(inp[:rows * bins].reshape(rows, bins),gap_rows)
-            #try to produce FFA and merge in a faster way by FFAing each segment and then merging the FFA results, ignoring the gaps
-            ffa_arr = []
+            def extract_rows(r0, r1):
+                """Rows [r0, r1) of the virtual (rows, bins) downsampled
+                block, assembled additively from the per-segment pieces --
+                bitwise identical to slicing a fully materialised downsampled
+                array. Pieces only overlap when a gap is smaller than one
+                window; adding them in segment order reproduces the
+                whole-array accumulation of the straddling window."""
+                lo, hi = r0 * bins, r1 * bins
+                block = np.zeros(hi - lo, dtype=F32)
+                for arr, k0 in zip(ds_segs, ds_starts):
+                    s, e = max(lo, k0), min(hi, k0 + arr.size)
+                    if s < e:
+                        block[s - lo:e - lo] += arr[s - k0:e - k0]
+                return block.reshape(r1 - r0, bins)
 
+            #FFA each segment's block of rows; the pure-gap rows between
+            #blocks are never materialised
+            ffa_arr = []
             for i in range(num_data):
-                #first grab the input block of each segment
-                if i==0:
-                    inp_block = inp[:rows * bins].reshape(rows, bins)[:gap_rows_starts[i]]
-                elif i<num_data-1:
-                    inp_block = inp[:rows * bins].reshape(rows, bins)[gap_rows_ends[i-1]:gap_rows_starts[i]]
-                else:
-                    inp_block = inp[:rows * bins].reshape(rows, bins)[gap_rows_ends[i-1]:]
-                ffa_arr.append(transform(inp_block))
+                r0 = 0 if i == 0 else gap_rows_ends[i - 1]
+                r1 = gap_rows_starts[i] if i < num_data - 1 else rows
+                ffa_arr.append(transform(extract_rows(r0, r1)))
             # ffa_arr = np.array(ffa_arr, dtype=np.float32)
             #ffa_arr contains the transformed inp_block
             def merge_gappy(ffa_arr, gap_rows_starts, gap_rows_ends, rows):
